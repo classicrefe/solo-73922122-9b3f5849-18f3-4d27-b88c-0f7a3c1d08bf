@@ -1,0 +1,20 @@
+services:
+  web:
+    build: .
+    ports:
+      - "8000:8000"
+    environment:
+      # 上传总量安全阀（字节），默认 1 GiB；单行 64 KiB 限制在应用内执行
+      MAX_UPLOAD_BYTES: "1073741824"
+    volumes:
+      - appdata:/data
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request;urllib.request.urlopen('http://127.0.0.1:8000/healthz')"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+      start_period: 5s
+    restart: unless-stopped
+
+volumes:
+  appdata:

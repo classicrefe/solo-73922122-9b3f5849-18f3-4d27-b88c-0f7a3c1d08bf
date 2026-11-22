@@ -1,0 +1,49 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>桥梁巡检单 · 拆表 / 还原</title>
+<style>
+  body { font-family: system-ui, "PingFang SC", "Microsoft YaHei", sans-serif;
+         max-width: 880px; margin: 2rem auto; padding: 0 1rem; color: #222; }
+  h1 { font-size: 1.4rem; }
+  section { border: 1px solid #ddd; border-radius: 8px; padding: 1rem 1.2rem;
+            margin: 1.2rem 0; }
+  h2 { font-size: 1.1rem; margin-top: 0; }
+  code { background: #f4f4f4; padding: 0 .3em; border-radius: 4px; }
+  button { padding: .45rem 1.1rem; border: 0; border-radius: 6px;
+           background: #0b5fff; color: #fff; cursor: pointer; }
+  button:hover { background: #0948c4; }
+  .hint { color: #666; font-size: .9rem; }
+</style>
+</head>
+<body>
+<h1>桥梁巡检单表包工具</h1>
+<p class="hint">
+  巡检 JSONL 每行一张巡检单，单行不超过 {{ max_line_kib }} KiB。
+  巡检号字段 <code>inspect_no</code> 须全文件唯一；
+  测点清单 <code>points</code>、照片清单 <code>photos</code> 可缺省、为 <code>null</code> 或为数组。
+</p>
+
+<section>
+  <h2>① 拆表：巡检 JSONL → 表包 ZIP</h2>
+  <form method="post" action="/split" enctype="multipart/form-data">
+    <input type="file" name="file" required>
+    <button type="submit">拆表并生成表包</button>
+  </form>
+  <p class="hint">按唯一巡检号拆成 <code>main.jsonl</code>、<code>points.jsonl</code>、
+    <code>photos.jsonl</code> 三表并打成 ZIP；各表行序不限。</p>
+</section>
+
+<section>
+  <h2>② 还原：表包 ZIP → 巡检 JSONL</h2>
+  <form method="post" action="/restore" enctype="multipart/form-data">
+    <input type="file" name="file" accept=".zip" required>
+    <button type="submit">校验整包并还原</button>
+  </form>
+  <p class="hint">校验无主行、重复位置、缺位 / 多余明细等问题；
+    全部通过后才开放还原文件下载，否则整包退回并列出问题。</p>
+</section>
+</body>
+</html>

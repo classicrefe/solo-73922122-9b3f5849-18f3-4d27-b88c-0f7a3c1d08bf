@@ -1,0 +1,58 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>{{ "拆表" if mode == "split" else "还原" }}结果</title>
+<style>
+  body { font-family: system-ui, "PingFang SC", "Microsoft YaHei", sans-serif;
+         max-width: 880px; margin: 2rem auto; padding: 0 1rem; color: #222; }
+  .ok   { border: 1px solid #3aa655; background: #f0fbf3; border-radius: 8px; padding: 1rem 1.2rem; }
+  .fail { border: 1px solid #d64545; background: #fff5f5; border-radius: 8px; padding: 1rem 1.2rem; }
+  table { border-collapse: collapse; width: 100%; margin: .8rem 0; font-size: .9rem; }
+  th, td { border: 1px solid #ddd; padding: .35rem .55rem; text-align: left;
+           vertical-align: top; word-break: break-all; }
+  th { background: #f6f6f6; }
+  a.btn { display: inline-block; padding: .5rem 1.2rem; border-radius: 6px;
+          background: #0b5fff; color: #fff; text-decoration: none; }
+  code { background: #f4f4f4; padding: 0 .3em; border-radius: 4px; }
+  .muted { color: #666; font-size: .9rem; }
+</style>
+</head>
+<body>
+<h1>{{ "拆表" if mode == "split" else "还原" }}结果</h1>
+
+{% if ok %}
+<div class="ok">
+  <p><strong>✔ 处理成功。</strong></p>
+  <table>
+    {% for k, v in stats.items() %}
+    <tr><th>{{ k }}</th><td>{{ v }}</td></tr>
+    {% endfor %}
+  </table>
+  <p><a class="btn" href="{{ download_url }}">下载{{ "表包 ZIP" if mode == "split" else "还原 JSONL" }}</a>
+     &nbsp;<a href="/">返回首页</a></p>
+</div>
+{% else %}
+<div class="fail">
+  <p><strong>✘ {{ message }}</strong>{% if mode == "restore" %}，未生成还原文件{% endif %}。</p>
+  {% if errors %}
+  <p>共 {{ errors.total }} 个问题：
+    {% for k, v in errors.by_kind.items() %}<code>{{ k }} × {{ v }}</code>{% endfor %}
+  </p>
+  <table>
+    <tr><th>#</th><th>类型</th><th>表</th><th>行号</th><th>说明</th></tr>
+    {% for e in errors["items"] %}
+    <tr><td>{{ loop.index }}</td><td>{{ e.kind }}</td><td>{{ e.table }}</td>
+        <td>{{ e.line }}</td><td>{{ e.message }}</td></tr>
+    {% endfor %}
+  </table>
+  {% if errors.truncated %}
+  <p class="muted">仅展示前 {{ errors["items"]|length }} 条，其余 {{ errors.total - errors["items"]|length }} 条从略。</p>
+  {% endif %}
+  {% endif %}
+  <p><a href="/">返回首页</a></p>
+</div>
+{% endif %}
+</body>
+</html>
