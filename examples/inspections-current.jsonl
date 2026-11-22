@@ -1,0 +1,5 @@
+{"inspect_no":"JX-2026-0001","bridge":"青云江大桥","date":"2026-11-18","inspector":"王工","weather":"多云","points":[{"position":"主梁跨中","value":12.41,"unit":"mm"},{"position":"2号桥墩","value":4.21,"unit":"mm"},{"position":"支座A","value":0.83,"unit":"mm"},{"position":"伸缩缝B","value":1.02,"unit":"mm"}],"photos":[{"position":"主梁跨中","file":"p001.jpg","note":"裂缝扩展"},{"position":"2号桥墩","file":"p002.jpg"}]}
+{"inspect_no":"JX-2026-0002","bridge":"白沙渡槽","date":"2026-11-02","inspector":"李工","points":[],"photos":[]}
+{"inspect_no":"JX-2026-0004","bridge":"青石拱桥","date":"2026-11-04","inspector":"赵工","photos":null}
+{"inspect_no":"JX-2026-0005","bridge":"浔江特大桥","date":"2026-11-05","inspector":"李工","remark":"含中文与特殊字符 <>&\"'","points":[{"position":"塔顶","value":null,"tags":["风振","复测"],"meta":{"device":"D-7","ok":true}}],"photos":[{"position":"塔顶","file":"p201.jpg"}]}
+{"inspect_no":"JX-2026-0006","bridge":"新月立交","date":"2026-11-19","inspector":"周工","points":[{"position":"桥面","value":0.12,"unit":"mm"}],"photos":null}

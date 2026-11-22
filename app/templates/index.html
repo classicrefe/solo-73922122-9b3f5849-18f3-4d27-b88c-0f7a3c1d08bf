@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>桥梁巡检单 · 拆表 / 还原</title>
+<title>桥梁巡检单 · 拆表 / 还原 / 差异导出</title>
 <style>
   body { font-family: system-ui, "PingFang SC", "Microsoft YaHei", sans-serif;
          max-width: 880px; margin: 2rem auto; padding: 0 1rem; color: #222; }
@@ -15,7 +15,10 @@
   button { padding: .45rem 1.1rem; border: 0; border-radius: 6px;
            background: #0b5fff; color: #fff; cursor: pointer; }
   button:hover { background: #0948c4; }
+  input[type=text] { padding: .4rem .5rem; border: 1px solid #bbb; border-radius: 6px;
+                     width: 16rem; }
   .hint { color: #666; font-size: .9rem; }
+  label { display: inline-block; margin: .25rem .8rem .25rem 0; }
 </style>
 </head>
 <body>
@@ -44,6 +47,30 @@
   </form>
   <p class="hint">校验无主行、重复位置、缺位 / 多余明细等问题；
     全部通过后才开放还原文件下载，否则整包退回并列出问题。</p>
+</section>
+
+<section>
+  <h2>③ 差异导出：基线表包 + 当前表包 → 增量 JSONL</h2>
+  <form method="post" action="/diff" enctype="multipart/form-data">
+    <label>基线表包 <input type="file" name="baseline" accept=".zip" required></label>
+    <label>当前表包 <input type="file" name="current" accept=".zip" required></label>
+    <label>导出单号
+      <input type="text" name="batch_no" maxlength="64" required
+             placeholder="如 EXP-2026-0001"></label>
+    <button type="submit">比较并生成增量流</button>
+  </form>
+  <p class="hint">按巡检号及测点 / 照片的稳定序号识别新增、修改、删除；一张巡检单的主记录与
+    两类明细变化归为同一变更组，删除项保留原值与序号。任一表包校验失败、明细关联缺失或
+    同一序号含糊（重复位置）时整单退回，不提供下载。同一导出单号配相同两包返回原结果，
+    换包则拒绝。</p>
+  {% if examples %}
+  <p class="hint">演示样例：
+    {% for name, label in examples %}
+    <a href="{{ url_for('example', name=name) }}">{{ label }}</a>
+    （先经 ① 拆成基线 / 当前表包，再到此处比较）{% if not loop.last %}；{% endif %}
+    {% endfor %}
+  </p>
+  {% endif %}
 </section>
 </body>
 </html>

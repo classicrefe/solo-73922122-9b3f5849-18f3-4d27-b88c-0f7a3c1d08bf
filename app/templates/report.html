@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>{{ "拆表" if mode == "split" else "还原" }}结果</title>
+<title>{{ {"split": "拆表", "restore": "还原", "diff": "差异导出"}.get(mode, mode) }}结果</title>
 <style>
   body { font-family: system-ui, "PingFang SC", "Microsoft YaHei", sans-serif;
          max-width: 880px; margin: 2rem auto; padding: 0 1rem; color: #222; }
@@ -17,25 +17,37 @@
           background: #0b5fff; color: #fff; text-decoration: none; }
   code { background: #f4f4f4; padding: 0 .3em; border-radius: 4px; }
   .muted { color: #666; font-size: .9rem; }
+  .notice { border: 1px solid #c9a227; background: #fffbe6; border-radius: 6px;
+            padding: .6rem .8rem; }
 </style>
 </head>
 <body>
-<h1>{{ "拆表" if mode == "split" else "还原" }}结果</h1>
+<h1>{{ {"split": "拆表", "restore": "还原", "diff": "差异导出"}.get(mode, mode) }}结果</h1>
 
 {% if ok %}
 <div class="ok">
   <p><strong>✔ 处理成功。</strong></p>
+  {% if notice %}<p class="notice">{{ notice }}</p>{% endif %}
+  {% if mode == "diff" %}
+  <p class="muted">
+    导出单号 <code>{{ batch_no }}</code>{% if replayed %}（重放：返回首次结果）{% else %}（首次导出）{% endif %}<br>
+    基线包 SHA-256 <code>{{ shas[0] }}</code><br>
+    当前包 SHA-256 <code>{{ shas[1] }}</code>
+    {% if result_sha256 %}<br>增量流 SHA-256 <code>{{ result_sha256 }}</code>{% endif %}
+  </p>
+  {% endif %}
   <table>
     {% for k, v in stats.items() %}
     <tr><th>{{ k }}</th><td>{{ v }}</td></tr>
     {% endfor %}
   </table>
-  <p><a class="btn" href="{{ download_url }}">下载{{ "表包 ZIP" if mode == "split" else "还原 JSONL" }}</a>
+  <p><a class="btn" href="{{ download_url }}">下载{{ {"split": "表包 ZIP",
+        "restore": "还原 JSONL"}.get(mode, "增量 JSONL") }}</a>
      &nbsp;<a href="/">返回首页</a></p>
 </div>
 {% else %}
 <div class="fail">
-  <p><strong>✘ {{ message }}</strong>{% if mode == "restore" %}，未生成还原文件{% endif %}。</p>
+  <p><strong>✘ {{ message }}</strong>{% if mode == "restore" %}，未生成还原文件{% endif %}{% if mode == "diff" %}，未生成增量文件{% endif %}。</p>
   {% if errors %}
   <p>共 {{ errors.total }} 个问题：
     {% for k, v in errors.by_kind.items() %}<code>{{ k }} × {{ v }}</code>{% endfor %}

@@ -1,4 +1,4 @@
-"""桥梁巡检单拆表 / 还原 / 校验核心逻辑。
+"""桥梁巡检单拆表 / 还原 / 差异导出核心逻辑。
 
 数据约定
 --------
@@ -14,9 +14,17 @@
     ``{"points": "absent|null|list", "points_len": N, "photos": ..., "photos_len": N}``
   - 明细行 = ``{"_no": 巡检号, "_seq": 原序号(0 起), ...清单项原字段...}``
 
+差异导出（比较基线包与当前包）
+------------------------------
+  - 两个表包都先按还原规则整包校验；任一包不通过则整单退回，不产生增量流；
+  - 巡检号是巡检单主键；测点 / 照片明细以原 ``_seq`` 为稳定序号逐位比较；
+  - 同一巡检单的主记录及两类明细变化合并为一个变更组（JSONL 一行）；
+  - 删除的明细保留删除前的原值与序号；
+  - 输出按巡检号升序、组内明细按 ``seq`` 升序遍历，故与表包内行序无关。
+
 内存设计
 --------
-拆表与还原均不随全包行数增长：
+拆表、还原与差异导出均不随全包行数增长：
   - 逐行流式读写（单行有上限，超限报错跳过）；
   - 需要按巡检号聚合 / 去重 / 关联的状态全部放在 SQLite（磁盘库，
     temp_store=FILE，页缓存约 2 MiB）；
@@ -32,6 +40,7 @@
 """
 from __future__ import annotations
 
+import hashlib
 import json
 import shutil
 import sqlite3
@@ -79,6 +88,14 @@ KIND_DUP_POS = "重复位置"
 KIND_MISSING = "缺位明细"
 KIND_EXTRA = "多余明细"
 KIND_PACKAGE = "包错误"
+KIND_BATCH_INVALID = "导出单号非法"
+KIND_BATCH_CONFLICT = "导出单号冲突"
+
+# 变更组 / 明细变更类型
+CHANGE_ADDED = "added"
+CHANGE_MODIFIED = "modified"
+CHANGE_DELETED = "deleted"
+CHANGE_UNCHANGED = "unchanged"
 
 
 class ErrorCollector:
@@ -97,6 +114,17 @@ class ErrorCollector:
             self.items.append(
                 {"kind": kind, "table": table, "line": line, "message": message}
             )
+
+    def merge(self, other: "ErrorCollector", label: str) -> None:
+        """并入另一个收集器（差异导出时基线包 / 当前包各有一份）。"""
+        self.total += other.total
+        self.by_kind.update(other.by_kind)
+        for item in other.items:
+            if len(self.items) >= self.limit:
+                break
+            merged = dict(item)
+            merged["table"] = f"{label}/{item['table']}"
+            self.items.append(merged)
 
     def __bool__(self) -> bool:
         return self.total > 0
@@ -124,6 +152,33 @@ class RestoreResult:
     out_path: str | None
     errors: ErrorCollector
     stats: dict = field(default_factory=dict)
+
+
+@dataclass
+class RestoreBundle:
+    """一次表包还原的完整产物（供差异导出复用，避免二次解包）。
+
+    ``digest`` 是表内容的规范化指纹（巡检号排序、明细按序号排序），
+    与 ZIP 的压缩字节 / 成员顺序 / 表内行序无关，用于导出单号幂等判定；
+    校验失败时为上传文件字节的 SHA-256（仅用于诊断）。
+    """
+    ok: bool
+    out_path: str | None
+    db_path: str | None
+    digest: str
+    errors: ErrorCollector
+    stats: dict = field(default_factory=dict)
+
+
+@dataclass
+class DiffResult:
+    ok: bool
+    out_path: str | None
+    errors: ErrorCollector
+    stats: dict = field(default_factory=dict)
+    baseline_digest: str = ""
+    current_digest: str = ""
+    result_digest: str = ""
 
 
 # ---------------------------------------------------------------------------
@@ -187,6 +242,15 @@ def _parse_obj(raw: bytes):
 
 def _dump(obj) -> str:
     return json.dumps(obj, ensure_ascii=False, separators=(",", ":"))
+
+
+def _canon(obj) -> str:
+    """规范化 JSON 文本：键排序，用于判定语义是否变化。
+
+    避免 Python ``True == 1`` / ``1 == 1.0`` 之类的宽松相等掩盖类型变化。
+    """
+    return json.dumps(obj, ensure_ascii=False, sort_keys=True,
+                      separators=(",", ":"))
 
 
 def _write_row(fh, obj) -> None:
@@ -339,23 +403,30 @@ def split_jsonl(src_path, work_dir) -> SplitResult:
 # 还原：三表 ZIP -> 巡检 JSONL
 # ---------------------------------------------------------------------------
 
-def restore_zip(zip_path, work_dir) -> RestoreResult:
-    """校验表包 ZIP 并还原为巡检 JSONL；任何错误都会退回整包。"""
+def restore_bundle(zip_path, work_dir, *, emit_jsonl: bool = True) -> RestoreBundle:
+    """校验表包 ZIP 并装载到磁盘 SQLite；校验通过时可选生成还原 JSONL。
+
+    差异导出复用本函数：两包各自通过同一套整包校验后，直接读取磁盘库比对，
+    无需二次解包或把全包载入内存。
+    """
     work = Path(work_dir)
     work.mkdir(parents=True, exist_ok=True)
     errors = ErrorCollector()
     stats = {"main_rows": 0, "points_rows": 0, "photos_rows": 0, "ignored_entries": []}
+    # 先记录上传文件的字节指纹；校验通过后再计算与行序无关的表内容指纹
+    file_digest = file_sha256(zip_path)
+    digest = file_digest
 
     # 1) 解包（流式；不使用条目名作为输出路径，天然免疫 zip-slip）
     try:
         zf = zipfile.ZipFile(zip_path)
     except zipfile.BadZipFile:
         errors.add(KIND_PACKAGE, "-", "-", "不是有效的 ZIP 文件")
-        return RestoreResult(False, None, errors, stats)
+        return RestoreBundle(False, None, None, digest, errors, stats)
     with zf:
         entry_map = _map_entries(zf, errors)
         if errors:
-            return RestoreResult(False, None, errors, stats)
+            return RestoreBundle(False, None, None, digest, errors, stats)
         used = {info.filename for info in entry_map.values()}
         stats["ignored_entries"] = sorted(
             i.filename for i in zf.infolist()
@@ -369,7 +440,8 @@ def restore_zip(zip_path, work_dir) -> RestoreResult:
             extracted[t_] = dst
 
     # 2) 建库（磁盘），装载三表
-    db = sqlite3.connect(str(work / f"restore-{uuid.uuid4().hex}.db"))
+    db_path = work / f"restore-{uuid.uuid4().hex}.db"
+    db = sqlite3.connect(str(db_path))
     _tune_db(db)
     db.execute("CREATE TABLE main (ord INTEGER, no TEXT, meta TEXT, payload TEXT)")
     db.execute("CREATE TABLE points (ord INTEGER, no TEXT, seq INTEGER, payload TEXT)")
@@ -393,41 +465,88 @@ def restore_zip(zip_path, work_dir) -> RestoreResult:
 
     if errors:
         db.close()
-        return RestoreResult(False, None, errors, stats)
+        db_path.unlink(missing_ok=True)
+        return RestoreBundle(False, None, None, file_digest, errors, stats)
+
+    digest = _canonical_digest(db)
+    stats["content_sha256"] = digest
 
     # 4) 全部通过：按主表行序输出，清单按 _seq 还原原顺序
-    out_path = work / "restored.jsonl"
-    n_out = 0
-    with open(out_path, "w", encoding="utf-8", newline="\n") as out:
-        cur = db.execute("SELECT no, meta, payload FROM main ORDER BY ord")
-        while True:
-            rows = cur.fetchmany(256)
-            if not rows:
-                break
-            for no, meta_json, payload_json in rows:
-                meta = json.loads(meta_json)
-                obj = json.loads(payload_json)
-                for f_ in LIST_FIELDS:
-                    st = meta[f_]
-                    if st == STATE_LIST:
-                        t_ = FIELD_TO_TABLE[f_]
-                        obj[f_] = [
-                            json.loads(r[0])
-                            for r in db.execute(
-                                f"SELECT payload FROM {t_} WHERE no = ? ORDER BY seq",
-                                (no,),
-                            )
-                        ]
-                    elif st == STATE_NULL:
-                        obj[f_] = None
-                    # absent：不设置该字段，保持缺省
-                out.write(_dump(obj))
-                out.write("\n")
-                n_out += 1
+    out_path = None
+    if emit_jsonl:
+        out_path = work / "restored.jsonl"
+        n_out = 0
+        with open(out_path, "w", encoding="utf-8", newline="\n") as out:
+            cur = db.execute("SELECT no, meta, payload FROM main ORDER BY ord")
+            while True:
+                rows = cur.fetchmany(256)
+                if not rows:
+                    break
+                for no, meta_json, payload_json in rows:
+                    meta = json.loads(meta_json)
+                    obj = json.loads(payload_json)
+                    for f_ in LIST_FIELDS:
+                        st = meta[f_]
+                        if st == STATE_LIST:
+                            t_ = FIELD_TO_TABLE[f_]
+                            obj[f_] = [
+                                json.loads(r[0])
+                                for r in db.execute(
+                                    f"SELECT payload FROM {t_} WHERE no = ? ORDER BY seq",
+                                    (no,),
+                                )
+                            ]
+                        elif st == STATE_NULL:
+                            obj[f_] = None
+                        # absent：不设置该字段，保持缺省
+                    out.write(_dump(obj))
+                    out.write("\n")
+                    n_out += 1
+        stats["restored_records"] = n_out
+        stats["out_bytes"] = out_path.stat().st_size
     db.close()
-    stats["restored_records"] = n_out
-    stats["out_bytes"] = out_path.stat().st_size
-    return RestoreResult(True, str(out_path), errors, stats)
+    return RestoreBundle(True, str(out_path) if out_path else None, str(db_path),
+                         digest, errors, stats)
+
+
+def restore_zip(zip_path, work_dir) -> RestoreResult:
+    """校验表包 ZIP 并还原为巡检 JSONL；任何错误都会退回整包。"""
+    bundle = restore_bundle(zip_path, work_dir, emit_jsonl=True)
+    return RestoreResult(bundle.ok, bundle.out_path, bundle.errors, bundle.stats)
+
+
+def file_sha256(path) -> str:
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(1024 * 1024), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def _canonical_digest(db) -> str:
+    """表内容的规范化 SHA-256：与表内行序、ZIP 成员顺序、压缩参数无关。
+
+    主表按巡检号排序，明细按 (巡检号, 序号) 排序后逐行（键排序规范化）喂给哈希，
+    因此同一批数据无论怎样重新打包，指纹都相同。内存只保留哈希状态与一行。
+    """
+    h = hashlib.sha256()
+    h.update(b"bridge-inspection-tables-v1\n")
+    for no, meta, payload in db.execute(
+            "SELECT no, meta, payload FROM main ORDER BY no"):
+        h.update(b"M")
+        h.update(_canon({"inspect_no": no,
+                         "meta": json.loads(meta),
+                         "payload": json.loads(payload)}).encode("utf-8"))
+        h.update(b"\n")
+    for table in DETAIL_TABLES:
+        # 校验通过后 (巡检号, 序号) 唯一，排序键与表内行序 / 键序无关
+        for no, seq, payload in db.execute(
+                f"SELECT no, seq, payload FROM {table} ORDER BY no, seq"):
+            h.update(table[:1].upper().encode())
+            h.update(_canon({"inspect_no": no, "seq": seq,
+                             "payload": json.loads(payload)}).encode("utf-8"))
+            h.update(b"\n")
+    return h.hexdigest()
 
 
 def _map_entries(zf: zipfile.ZipFile, errors: ErrorCollector) -> dict:
@@ -567,3 +686,281 @@ def _check_coverage(db, errors: ErrorCollector, table: str, field_: str) -> None
                        f"巡检号 {no!r}：声明 {expected} 条，多出序号 "
                        f"{_fmt_seqs(extra)}{suffix}")
         # 集合相等但存在重复序号的情况已由“重复位置”报告，此处不再重复
+
+
+# ---------------------------------------------------------------------------
+# 差异导出：基线表包 + 当前表包 -> 增量 JSONL
+# ---------------------------------------------------------------------------
+
+def validate_batch_no(value) -> tuple[str | None, str | None]:
+    """校验导出单号；返回 (规范化值, 错误消息)。"""
+    if not isinstance(value, str):
+        return None, "导出单号必须是字符串"
+    batch_no = value.strip()
+    if not batch_no:
+        return None, "导出单号不能为空"
+    if len(batch_no) > 64:
+        return None, "导出单号不能超过 64 个字符"
+    if any(ord(ch) < 32 or ord(ch) == 127 for ch in batch_no):
+        return None, "导出单号不能包含控制字符"
+    return batch_no, None
+
+
+def _detail_changes(db, table: str, no: str, list_key: str, stats: dict,
+                    mode: str = "both") -> list:
+    """按稳定序号归并比较两类明细；返回该巡检号的明细变更列表（按 seq 升序）。
+
+    mode:
+      - ``both``：两侧逐序号归并（修改的巡检单）；
+      - ``added``：巡检单整单新增，当前包全部明细记为新增；
+      - ``deleted``：巡检单整单删除，基线包全部明细记为删除（保留原值与序号）。
+
+    两侧游标各自按 seq 升序推进，同时只保留一行，内存不随明细总数增长。
+    """
+    if mode == "added":
+        changes = []
+        for seq, payload in db.execute(
+                f"SELECT seq, payload FROM curdb.{table} WHERE no = ? ORDER BY seq",
+                (no,)):
+            changes.append({"seq": seq, "change": CHANGE_ADDED,
+                            "after": json.loads(payload)})
+            stats[f"{list_key}_added"] += 1
+        return changes
+    if mode == "deleted":
+        changes = []
+        for seq, payload in db.execute(
+                f"SELECT seq, payload FROM {table} WHERE no = ? ORDER BY seq", (no,)):
+            changes.append({"seq": seq, "change": CHANGE_DELETED,
+                            "before": json.loads(payload)})
+            stats[f"{list_key}_deleted"] += 1
+        return changes
+
+    bcur = db.execute(
+        f"SELECT seq, payload FROM {table} WHERE no = ? ORDER BY seq", (no,))
+    ccur = db.execute(
+        f"SELECT seq, payload FROM curdb.{table} WHERE no = ? ORDER BY seq", (no,))
+    changes = []
+    b = bcur.fetchone()
+    c = ccur.fetchone()
+    while b is not None or c is not None:
+        if c is None or (b is not None and b[0] < c[0]):
+            changes.append({"seq": b[0], "change": CHANGE_DELETED,
+                            "before": json.loads(b[1])})
+            stats[f"{list_key}_deleted"] += 1
+            b = bcur.fetchone()
+        elif b is None or c[0] < b[0]:
+            changes.append({"seq": c[0], "change": CHANGE_ADDED,
+                            "after": json.loads(c[1])})
+            stats[f"{list_key}_added"] += 1
+            c = ccur.fetchone()
+        else:
+            before = json.loads(b[1])
+            after = json.loads(c[1])
+            if _canon(before) != _canon(after):
+                changes.append({"seq": b[0], "change": CHANGE_MODIFIED,
+                                "before": before, "after": after})
+                stats[f"{list_key}_modified"] += 1
+            b = bcur.fetchone()
+            c = ccur.fetchone()
+    return changes
+
+
+def _side(payload_json, meta_json) -> dict | None:
+    if payload_json is None:
+        return None
+    meta = json.loads(meta_json)
+    return {
+        "fields": json.loads(payload_json),
+        "lists": {f_: meta[f_] for f_ in LIST_FIELDS},
+    }
+
+
+def diff_packages(baseline_zip, current_zip, work_dir) -> DiffResult:
+    """比较两个表包，输出仅含变化的增量 JSONL（每个变更组一行）。
+
+    - 两个包都必须先通过完整的还原校验；任一不通过则整单退回，不产出文件。
+    - 巡检号是主键；测点 / 照片明细以原 ``_seq`` 为稳定序号比较。
+    - 同一巡检单的主记录与两类明细变化归入同一变更组。
+    - 输出按巡检号升序、组内明细按 seq 升序，结果与包内行序无关。
+    """
+    work = Path(work_dir)
+    work.mkdir(parents=True, exist_ok=True)
+    base = restore_bundle(baseline_zip, work / "baseline", emit_jsonl=False)
+    cur = restore_bundle(current_zip, work / "current", emit_jsonl=False)
+    return diff_bundles(base, cur, work / "diff")
+
+
+def diff_bundles(base: RestoreBundle, cur: RestoreBundle, work_dir) -> DiffResult:
+    """在两个已还原、已验证的包上做差异导出（供 Web 层复用一次还原结果）。
+
+    ``base.digest`` / ``cur.digest`` 为表内容规范化指纹，与 ZIP 字节及表内行序无关。
+    """
+    work = Path(work_dir)
+    work.mkdir(parents=True, exist_ok=True)
+
+    errors = ErrorCollector()
+    if not base.ok:
+        errors.merge(base.errors, "baseline")
+    if not cur.ok:
+        errors.merge(cur.errors, "current")
+
+    stats = {
+        "baseline_records": base.stats.get("main_rows", 0),
+        "current_records": cur.stats.get("main_rows", 0),
+        "groups": 0, "added_records": 0, "modified_records": 0,
+        "deleted_records": 0, "unchanged_records": 0,
+        "points_added": 0, "points_modified": 0, "points_deleted": 0,
+        "photos_added": 0, "photos_modified": 0, "photos_deleted": 0,
+    }
+    if errors:
+        return DiffResult(False, None, errors, stats,
+                          base.digest, cur.digest)
+
+    db = sqlite3.connect(str(base.db_path))
+    _tune_db(db)
+    db.execute("ATTACH DATABASE ? AS curdb",
+               (str(Path(cur.db_path).resolve()),))
+    out_path = work / "diff.jsonl"
+    try:
+        with open(out_path, "w", encoding="utf-8", newline="\n") as out:
+            nos = db.execute(
+                "SELECT no FROM main UNION SELECT no FROM curdb.main ORDER BY no")
+            for (no,) in nos:
+                b_row = db.execute(
+                    "SELECT meta, payload FROM main WHERE no = ?", (no,)).fetchone()
+                c_row = db.execute(
+                    "SELECT meta, payload FROM curdb.main WHERE no = ?",
+                    (no,)).fetchone()
+                before = _side(b_row[1], b_row[0]) if b_row else None
+                after = _side(c_row[1], c_row[0]) if c_row else None
+
+                if before is None:
+                    change = CHANGE_ADDED
+                elif after is None:
+                    change = CHANGE_DELETED
+                elif _canon(before) != _canon(after):
+                    change = CHANGE_MODIFIED
+                else:
+                    change = None  # 主记录一致，是否有变化由明细决定
+
+                mode = {CHANGE_ADDED: "added", CHANGE_DELETED: "deleted"}.get(
+                    change, "both")
+                points = _detail_changes(db, TABLE_POINTS, no, "points", stats, mode)
+                photos = _detail_changes(db, TABLE_PHOTOS, no, "photos", stats, mode)
+
+                if change is None:
+                    change = CHANGE_MODIFIED if (points or photos) else CHANGE_UNCHANGED
+
+                if change == CHANGE_UNCHANGED:
+                    stats["unchanged_records"] += 1
+                    continue
+                stats["groups"] += 1
+                stats[f"{change}_records"] += 1
+                group = {
+                    "inspect_no": no,
+                    "change": change,
+                    "before": before,
+                    "after": after,
+                    "points": points,
+                    "photos": photos,
+                }
+                out.write(_dump(group))
+                out.write("\n")
+    finally:
+        db.close()
+
+    stats["out_bytes"] = out_path.stat().st_size
+    digest = file_sha256(out_path)
+    stats["result_sha256"] = digest
+    return DiffResult(True, str(out_path), errors, stats,
+                      base.digest, cur.digest, digest)
+
+
+class DiffRegistry:
+    """导出单号幂等登记（SQLite，跨进程安全）。
+
+    - 同一单号 + 相同两个表包：返回原结果（原 token 与统计）；
+    - 同一单号 + 不同表包：拒绝（调用方返回 409）；
+    - 未登记的单号：首次成功后才写入，失败不占用单号。
+    """
+
+    def __init__(self, db_path):
+        self.db_path = Path(db_path)
+        self.db_path.parent.mkdir(parents=True, exist_ok=True)
+        con = self._connect()
+        try:
+            con.execute(
+                "CREATE TABLE IF NOT EXISTS diff_exports ("
+                " batch_no TEXT PRIMARY KEY,"
+                " baseline_sha256 TEXT NOT NULL,"
+                " current_sha256 TEXT NOT NULL,"
+                " token TEXT NOT NULL,"
+                " stats TEXT NOT NULL,"
+                " result_sha256 TEXT NOT NULL,"
+                " created_at TEXT NOT NULL)"
+            )
+            con.commit()
+        finally:
+            con.close()
+
+    def _connect(self):
+        con = sqlite3.connect(str(self.db_path), timeout=30)
+        con.execute("PRAGMA busy_timeout = 30000")
+        con.execute("PRAGMA journal_mode = WAL")
+        return con
+
+    @staticmethod
+    def _row_to_record(row) -> dict | None:
+        if row is None:
+            return None
+        return {
+            "batch_no": row[0],
+            "baseline_sha256": row[1],
+            "current_sha256": row[2],
+            "token": row[3],
+            "stats": json.loads(row[4]),
+            "result_sha256": row[5],
+        }
+
+    def get(self, batch_no: str) -> dict | None:
+        con = self._connect()
+        try:
+            row = con.execute(
+                "SELECT batch_no, baseline_sha256, current_sha256, token,"
+                " stats, result_sha256 FROM diff_exports WHERE batch_no = ?",
+                (batch_no,),
+            ).fetchone()
+        finally:
+            con.close()
+        return self._row_to_record(row)
+
+    def add(self, batch_no, baseline_sha256, current_sha256, token,
+            stats, result_sha256) -> tuple[dict, bool]:
+        """登记导出结果；返回 (现存记录, 是否本次新建)。"""
+        from datetime import datetime, timezone
+        con = self._connect()
+        try:
+            try:
+                con.execute(
+                    "INSERT INTO diff_exports VALUES (?,?,?,?,?,?,?)",
+                    (batch_no, baseline_sha256, current_sha256, token,
+                     _dump(stats), result_sha256,
+                     datetime.now(timezone.utc).isoformat(timespec="seconds")),
+                )
+                con.commit()
+                return self.get(batch_no), True
+            except sqlite3.IntegrityError:
+                con.rollback()
+        finally:
+            con.close()
+        return self.get(batch_no), False
+
+    def forget(self, batch_no: str, token: str) -> None:
+        """删除已登记但结果文件缺失的陈旧记录。"""
+        con = self._connect()
+        try:
+            con.execute("DELETE FROM diff_exports WHERE batch_no = ? AND token = ?",
+                        (batch_no, token))
+            con.commit()
+        finally:
+            con.close()
